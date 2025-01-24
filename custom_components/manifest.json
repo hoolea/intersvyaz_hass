@@ -1,9 +1,0 @@
-{
-  "domain": "intersvyaz",
-  "name": "Intersvyaz Domofon",
-  "documentation": "https://github.com/hoolea/intersvyaz_hass",
-  "dependencies": [],
-  "codeowners": ["@hoolea"],
-  "requirements": [],
-  "version": "1.0.0"
-}
