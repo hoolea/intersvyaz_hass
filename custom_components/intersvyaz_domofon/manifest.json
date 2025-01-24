@@ -6,4 +6,5 @@
   "codeowners": ["@hoolea"],
   "requirements": [],
   "version": "1.0.0"
+  "config_flow": true
 }
