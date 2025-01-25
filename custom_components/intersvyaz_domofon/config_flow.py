@@ -63,13 +63,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     return True
 
 async def get_token(session, username, password):
-    url = f"{BASE_URL}/auth/login"
-    payload = {"login": username, "password": password}
+    url = f"{BASE_URL}/auth/mobile"
+    payload = {"username": username, "password": password}
     headers = {"Content-Type": "application/json"}
     async with session.post(url, json=payload, headers=headers) as resp:
         if resp.status == 200:
             data = await resp.json()
-            return data.get("token")
+            return data.get("TOKEN")
     return None
 
 async def get_relay_id(session, token):

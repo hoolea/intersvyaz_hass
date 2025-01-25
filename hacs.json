@@ -2,5 +2,6 @@
   "name": "Intersvyaz Domofon",
   "content_in_root": false,
   "domains": ["intersvyaz"],
-  "country": "RU"
+  "country": "RU",
+  "filename": "intersvyaz_domofon.zip"
 }
