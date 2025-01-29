@@ -32,6 +32,29 @@
 - У каждого пользователя свой **RELAY_ID**, он получается автоматически
 - Для работы необходим **доступ к интернету** и учетная запись Интерсвязи
 - Интеграция использует API: `https://api.is74.ru/auth/mobile`
+## Настройка карточки
+
+![image](https://github.com/user-attachments/assets/49a83747-7989-44e4-a481-a0d49bff3338)
+
+```yaml
+type: vertical-stack
+cards:
+  - show_state: false
+    show_name: false
+    camera_view: live
+    type: picture-entity
+    entity: camera.is74_camera_6
+  - show_name: true
+    show_icon: false
+    type: entity-button
+    entity: button.otkryt_domofon
+    name: Открыть дверь
+    icon: mdi:door-open
+    show_state: false
+    tap_action:
+      action: call-service
+      service: script.open_door_script
+```
 
 ## Ошибки и предложения
 Если у вас возникли проблемы или есть идеи для улучшения, создайте **issue** в [репозитории](https://github.com/USERNAME/intersvyaz_hass/issues).
