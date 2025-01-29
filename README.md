@@ -52,8 +52,7 @@ cards:
     icon: mdi:door-open
     show_state: false
     tap_action:
-      action: call-service
-      service: script.open_door_script
+      action: toggle
 ```
 
 ## Ошибки и предложения
