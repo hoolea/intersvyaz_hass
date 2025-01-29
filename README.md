@@ -1,6 +1,10 @@
 # Домофон Интерсвязь для Home Assistant
 
 ![HACS Badge](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)
+![65dd7249d10c4](https://github.com/user-attachments/assets/12a28991-a136-4ef5-91eb-0014b9fd90de)
+
+
+
 
 ## Описание
 Эта интеграция позволяет управлять домофоном **Интерсвязь** напрямую из **Home Assistant**.
