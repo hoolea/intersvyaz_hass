@@ -1,10 +1,10 @@
-import asyncio
 import logging
 import aiohttp
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import DOMAIN, open_door, get_token, get_relay_id
 
@@ -12,7 +12,9 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Настройка кнопки в Home Assistant."""
-    session = aiohttp.ClientSession()
+    # Используем сессию, предоставленную Home Assistant
+    session = async_get_clientsession(hass)
+    
     token = await get_token(session, entry.data["username"], entry.data["password"])
     
     if not token:
@@ -40,6 +42,6 @@ class DomofonButton(ButtonEntity):
 
     async def async_press(self):
         """Обработчик нажатия кнопки."""
-        session = aiohttp.ClientSession()
+        # Используем сессию, предоставленную Home Assistant
+        session = async_get_clientsession(self._hass)
         await open_door(session, self._token, self._relay_id)
-        await session.close()

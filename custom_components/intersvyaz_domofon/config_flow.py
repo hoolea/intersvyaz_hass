@@ -15,14 +15,15 @@ CONF_PASSWORD = "password"
 BASE_URL = "https://api.is74.ru"
 
 class IntersvyazConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """Класс для конфигурации интеграции Intersvyaz."""
     async def async_step_user(self, user_input=None):
+        """Обрабатывает шаг пользовательской настройки."""
         errors = {}
         if user_input is not None:
-            session = aiohttp.ClientSession()
-            token = await get_token(session, user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
-            if token:
-                return self.async_create_entry(title="Intersvyaz", data=user_input)
-            else:
+            async with aiohttp.ClientSession() as session:
+                token = await get_token(session, user_input[CONF_USERNAME], user_input[CONF_PASSWORD])
+                if token:
+                    return self.async_create_entry(title="Intersvyaz", data=user_input)
                 errors["base"] = "auth_failed"
         
         return self.async_show_form(
@@ -35,34 +36,37 @@ class IntersvyazConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Настройка интеграции при добавлении записи."""
     username = entry.data[CONF_USERNAME]
     password = entry.data[CONF_PASSWORD]
     
-    session = aiohttp.ClientSession()
-    token = await get_token(session, username, password)
-    if not token:
-        _LOGGER.error("Failed to authenticate with Intersvyaz API")
-        return False
-    
-    relay_id = await get_relay_id(session, token)
-    if not relay_id:
-        _LOGGER.error("Failed to retrieve relay ID")
-        return False
-    
-    async def handle_open_door(call: ServiceCall):
-        await open_door(session, token, relay_id)
-    
-    hass.services.async_register(DOMAIN, "open_door", handle_open_door)
-    
-    hass.data[DOMAIN] = {
-        "session": session,
-        "token": token,
-        "relay_id": relay_id
-    }
+    async with aiohttp.ClientSession() as session:
+        token = await get_token(session, username, password)
+        if not token:
+            _LOGGER.error("Не удалось аутентифицироваться в API Intersvyaz")
+            return False
+        
+        relay_id = await get_relay_id(session, token)
+        if not relay_id:
+            _LOGGER.error("Не удалось получить ID реле")
+            return False
+        
+        async def handle_open_door(call: ServiceCall):
+            """Обработчик сервиса открытия двери."""
+            await open_door(session, token, relay_id)
+        
+        hass.services.async_register(DOMAIN, "open_door", handle_open_door)
+        
+        hass.data[DOMAIN] = {
+            "session": session,
+            "token": token,
+            "relay_id": relay_id
+        }
     
     return True
 
-async def get_token(session, username, password):
+async def get_token(session: aiohttp.ClientSession, username: str, password: str) -> str | None:
+    """Получение токена авторизации."""
     url = f"{BASE_URL}/auth/mobile"
     payload = {"username": username, "password": password}
     headers = {"Content-Type": "application/json"}
@@ -72,7 +76,8 @@ async def get_token(session, username, password):
             return data.get("TOKEN")
     return None
 
-async def get_relay_id(session, token):
+async def get_relay_id(session: aiohttp.ClientSession, token: str) -> str | None:
+    """Получение ID реле."""
     url = f"{BASE_URL}/domofon/relays"
     headers = {"Authorization": f"Bearer {token}"}
     async with session.get(url, headers=headers) as resp:
@@ -82,7 +87,8 @@ async def get_relay_id(session, token):
                 return data["relays"][0]["id"]  # Берем первый реле
     return None
 
-async def open_door(session, token, relay_id):
+async def open_door(session: aiohttp.ClientSession, token: str, relay_id: str) -> None:
+    """Открытие двери через API."""
     url = f"{BASE_URL}/domofon/relays/{relay_id}/open?from=app"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -90,6 +96,6 @@ async def open_door(session, token, relay_id):
     }
     async with session.post(url, headers=headers) as resp:
         if resp.status == 200:
-            _LOGGER.info("Door opened successfully")
+            _LOGGER.info("Дверь успешно открыта")
         else:
-            _LOGGER.error("Failed to open door")
+            _LOGGER.error("Ошибка открытия двери")
