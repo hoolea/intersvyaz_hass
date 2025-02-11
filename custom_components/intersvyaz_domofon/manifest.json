@@ -1,12 +1,12 @@
 {
-  "domain": "intersvyaz",
-  "name": "Intersvyaz Domofon",
-  "codeowners": ["@hoolea"],
+  "domain": "intersvyaz_domofon",
+  "name": "Интерсвязь домофон",
+  "codeowners": ["@your_username"],
   "config_flow": true,
   "dependencies": ["network"],
-  "documentation": "https://github.com/hoolea/intersvyaz_hass",
+  "documentation": "https://github.com/your_username/ha-intersvyaz-domofon",
   "integration_type": "device",
-  "iot_class": "local_polling",
+  "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/hoolea/intersvyaz_hass/issues",
   "version": "1.0.0"
 }

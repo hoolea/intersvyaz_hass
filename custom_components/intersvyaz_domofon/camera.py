@@ -44,14 +44,12 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     """Настройка платформы камеры из записи конфигурации."""
-
-    # Используем клиентскую сессию Home Assistant
     session = async_get_clientsession(hass)
-
-    # Получаем токен
-    token = await get_token(session, entry.data["username"], entry.data["password"])
+    
+    # Получаем токен из сохраненных данных конфигурации
+    token = entry.data.get("token")
     if not token:
-        _LOGGER.error("Не удалось получить токен")
+        _LOGGER.error("Токен не найден в конфигурации")
         return
 
     # Получаем group_id
@@ -60,14 +58,14 @@ async def async_setup_entry(
         _LOGGER.error("Не удалось получить group_id")
         return
 
-    # Получаем UUID камер
-    uuids = await get_uuid_cam(session, token, group_id)
-    if not uuids:
-        _LOGGER.error("Не удалось получить UUID камеры")
+    # Получаем информацию о камерах
+    cameras_info = await get_cameras_info(session, token, group_id)
+    if not cameras_info:
+        _LOGGER.error("Не удалось получить информацию о камерах")
         return
 
     # Создаём камеры
-    cameras = [IS74Camera(entry.data, token, uuid) for uuid in uuids]
+    cameras = [IS74Camera(entry.data, token, camera_info) for camera_info in cameras_info]
     
     # Добавляем камеры
     async_add_entities(cameras)
@@ -81,20 +79,45 @@ async def async_setup_platform(
     """Настройка камеры IS74 через YAML-конфигурацию."""
     async_add_entities([IS74Camera(config)])
 
+async def get_cameras_info(session: aiohttp.ClientSession, token: str, group_id: str) -> list[dict] | None:
+    """Получает информацию о камерах."""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        async with session.get(
+            f"https://cams.is74.ru/api/get-group/{group_id}",
+            headers=headers,
+        ) as response:
+            if response.status == 200:
+                return await response.json()
+            return None
+    except aiohttp.ClientError as err:
+        _LOGGER.error("Ошибка при получении информации о камерах: %s", err)
+        return None
+
 class IS74Camera(Camera):
     """Реализация камеры IS74."""
 
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, config: dict[str, Any], token: str, uuid: str) -> None:
+    def __init__(self, config: dict[str, Any], token: str, camera_info: dict) -> None:
         """Инициализация камеры IS74."""
         super().__init__()
-        self._name: str = config.get(CONF_NAME, DEFAULT_NAME)
-        self._uuid: str = uuid
+        self._uuid: str = camera_info["UUID"]
+        self._name: str = camera_info["NAME"]
         self._token: str = token
+        self._attr_unique_id = f"is74_camera_{self._uuid}"
         self._input: str = (
             f"https://cdn.cams.is74.ru/hls/playlists/multivariant.m3u8?uuid={self._uuid}&realtime=1&token=bearer-{self._token}"
         )
+        
+        # Добавляем информацию об устройстве
+        self._attr_device_info = {
+            "identifiers": {("intersvyaz_domofon", config.get("device_id", "main"))},
+            "name": "Домофон Интерсвязь",
+            "manufacturer": "Интерсвязь",
+            "model": "Домофон IS74",
+            "sw_version": "1.0",
+        }
 
     async def stream_source(self) -> str:
         """Возвращает источник потока."""
