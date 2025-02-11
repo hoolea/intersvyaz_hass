@@ -1,5 +1,5 @@
 {
-  "domain": "intersvyaz_domofon",
+  "domain": "intersvyaz",
   "name": "Интерсвязь домофон",
   "codeowners": ["@hoolea"],
   "config_flow": true,
