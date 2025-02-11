@@ -1,6 +1,6 @@
 """Constants for the Intersvyaz Domofon integration."""
 
-DOMAIN = "intersvyaz_domofon"
+DOMAIN = "intersvyaz"
 BASE_URL = "https://api.is74.ru"
 BASE_URL_CAM = "https://cams.is74.ru"
 
