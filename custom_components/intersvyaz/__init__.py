@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 import homeassistant.helpers.config_validation as cv
 
 # Определение домена интеграции и базовых URL
-DOMAIN = "intersvyaz_domofon"
+DOMAIN = "intersvyaz"
 BASE_URL = "https://api.is74.ru"
 BASE_URL_CAM = "https://cams.is74.ru"
 
