@@ -5,14 +5,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 import uuid
 from typing import Optional
+from homeassistant.const import Platform
+import homeassistant.helpers.config_validation as cv
 
 # Определение домена интеграции и базовых URL
-DOMAIN = "domofon"
+DOMAIN = "intersvyaz_domofon"
 BASE_URL = "https://api.is74.ru"
 BASE_URL_CAM = "https://cams.is74.ru"
 
 # Логгер для отладки
 _LOGGER = logging.getLogger(__name__)
+
+PLATFORMS = [Platform.CAMERA, Platform.BUTTON]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Настройка интеграции."""
