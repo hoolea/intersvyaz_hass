@@ -1,7 +1,9 @@
 # Домофон Интерсвязь для Home Assistant
 
 ![HACS Badge](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)
-![65dd7249d10c4](https://github.com/user-attachments/assets/12a28991-a136-4ef5-91eb-0014b9fd90de)
+
+![407721900-12a28991-a136-4ef5-91eb-0014b9fd90de](https://github.com/user-attachments/assets/0be9d430-7642-4955-8f43-d44bd06aa38b)
+
 
 
 
