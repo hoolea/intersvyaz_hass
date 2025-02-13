@@ -96,7 +96,6 @@ async def get_cameras_info(session: aiohttp.ClientSession, token: str, group_id:
 
 class IS74Camera(Camera):
     """Реализация камеры IS74."""
-
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, config: dict[str, Any], token: str, camera_info: dict) -> None:
