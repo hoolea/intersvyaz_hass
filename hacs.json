@@ -1,7 +1,7 @@
 {
   "name": "Интерсвязь домофон",
   "content_in_root": false,
-  "domains": ["intersvyaz"],
-  "country": "RU",
-  "filename": "intersvyaz_domofon.zip"
+  "homeassistant": "2023.8.0",
+  "render_readme": true,
+  "country": "RU"
 }
