@@ -109,6 +109,9 @@ class IS74Camera(Camera):
             f"https://cdn.cams.is74.ru/hls/playlists/multivariant.m3u8?uuid={self._uuid}&realtime=1&token=bearer-{self._token}"
         )
         
+        # Логируем URL потока
+        _LOGGER.info("Полученный URL потока камеры: %s", self._input)
+
         # Добавляем информацию об устройстве
         self._attr_device_info = {
             "identifiers": {("intersvyaz_domofon", config.get("device_id", "main"))},
