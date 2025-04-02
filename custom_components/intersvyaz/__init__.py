@@ -87,18 +87,36 @@ async def get_relay_id(session: aiohttp.ClientSession, token: str) -> str | None
     return None
 
 async def get_group_id(session: aiohttp.ClientSession, token: str) -> str | None:
-    """Получение ID группы с названием, начинающимся на 'Умный двор'."""
+    """Получение ID группы с названием, начинающимся на 'Умный двор', или 'Свои камеры' через дополнительный запрос."""
+    # Первый запрос: ищем "Умный двор" по основному URL
     url = f"{BASE_URL_CAM}/api/get-group/"
     headers = {"Authorization": f"Bearer {token}"}
     
     async with session.get(url, headers=headers) as resp:
         data = await resp.json()
-        _LOGGER.info(f"Ответ API на group: {data}")
+        _LOGGER.info(f"Ответ API на group (основной URL): {data}")
         
+        # Проверяем наличие "Умный двор"
         for group in data:
             if group.get("NAME", "").startswith("Умный двор"):
+                _LOGGER.info(f"Найдена группа 'Умный двор' с ID: {group.get('ID')}")
                 return group.get("ID")
-        _LOGGER.error("Не найдена группа 'Умный двор'!")
+        
+        _LOGGER.info("Группа 'Умный двор' не найдена в основном запросе, проверяем 'Свои камеры'")
+
+    # Второй запрос: ищем "Свои камеры" с параметром ?selfCams=true
+    url_self_cams = f"{BASE_URL_CAM}/api/get-group/?selfCams=true"
+    async with session.get(url_self_cams, headers=headers) as resp:
+        data = await resp.json()
+        _LOGGER.info(f"Ответ API на group (с ?selfCams=true): {data}")
+        
+        # Проверяем наличие "Свои камеры"
+        for group in data:
+            if group.get("NAME", "") == "Свои камеры":
+                _LOGGER.info(f"Найдена группа 'Свои камеры' с ID: {group.get('ID')}")
+                return group.get("ID")
+        
+        _LOGGER.error("Не найдены ни группа 'Умный двор', ни 'Свои камеры'!")
     return None
 
 async def get_uuid_cam(session: aiohttp.ClientSession, token: str, group_id: str) -> list[str]:
