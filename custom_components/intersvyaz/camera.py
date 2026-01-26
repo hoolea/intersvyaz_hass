@@ -1,137 +1,189 @@
-from __future__ import annotations
-
-from typing import Any
+"""Camera platform for Intersvyaz Domofon integration."""
 import logging
 import aiohttp
-import voluptuous as vol
-from aiohttp import web
-from haffmpeg.camera import CameraMjpeg
-from haffmpeg.tools import IMAGE_JPEG
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-from homeassistant.components.camera import (
-    PLATFORM_SCHEMA as CAMERA_PLATFORM_SCHEMA,
-    Camera,
-    CameraEntityFeature,
-)
+from typing import Optional
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.entity import DeviceInfo
 
-from .const import CONF_UUID, CONF_TOKEN
-from . import get_token, get_uuid_cam, get_group_id
+from . import DOMAIN, BASE_URL_CAM, get_group_id, get_uuid_cam
+from .const import CONF_TOKEN
 
-# Логгер для вывода сообщений об ошибках
 _LOGGER = logging.getLogger(__name__)
 
-# Значение по умолчанию для имени камеры
-DEFAULT_NAME = "IS74 Camera"
-
-# Определение схемы конфигурации платформы
-PLATFORM_SCHEMA = CAMERA_PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_UUID): cv.string,
-        vol.Required(CONF_TOKEN): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-    }
-)
-
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
-) -> None:
-    """Настройка платформы камеры из записи конфигурации."""
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
+):
+    """Настройка камер в Home Assistant."""
     session = async_get_clientsession(hass)
     
     # Получаем токен из сохраненных данных конфигурации
-    token = entry.data.get("token")
+    token = entry.data.get(CONF_TOKEN)
     if not token:
         _LOGGER.error("Токен не найден в конфигурации")
         return
-
-    # Получаем group_id
+    
+    # Получаем ID группы камер
     group_id = await get_group_id(session, token)
     if not group_id:
-        _LOGGER.error("Не удалось получить group_id")
+        _LOGGER.error("Не удалось получить ID группы камер")
         return
-
-    # Получаем информацию о камерах
-    cameras_info = await get_cameras_info(session, token, group_id)
-    if not cameras_info:
-        _LOGGER.error("Не удалось получить информацию о камерах")
-        return
-
-    # Создаём камеры
-    cameras = [IS74Camera(entry.data, token, camera_info) for camera_info in cameras_info]
     
-    # Добавляем камеры
-    async_add_entities(cameras)
+    # Получаем список камер с их данными
+    cameras_data = await _get_cameras_data(session, token, group_id)
+    if not cameras_data:
+        _LOGGER.warning("Не найдено камер для отображения")
+        return
+    
+    _LOGGER.info(f"Создание {len(cameras_data)} камер")
+    
+    # Создаем камеры для каждого UUID
+    cameras = []
+    for camera_data in cameras_data:
+        uuid = camera_data.get("UUID")
+        if not uuid:
+            _LOGGER.warning(f"Пропущена камера без UUID: {camera_data}")
+            continue
+            
+        name = camera_data.get("NAME") or camera_data.get("TITLE") or f"Камера {uuid[:8]}"
+        
+        # Получаем URL потока из данных API, если доступен
+        stream_url = None
+        media = camera_data.get("MEDIA", {})
+        hls_data = media.get("HLS", {})
+        live_data = hls_data.get("LIVE", {})
+        if live_data:
+            # Используем MAIN поток (обычный, более стабильный) вместо LOW_LATENCY
+            stream_url = live_data.get("MAIN") or live_data.get("LOW_LATENCY")
+        
+        _LOGGER.info(f"Создание камеры: {name} (UUID: {uuid})")
+        cameras.append(
+            IntersvyazCamera(
+                hass=hass,
+                token=token,
+                uuid=uuid,
+                name=name,
+                unique_id=f"intersvyaz_camera_{uuid}",
+                stream_url=stream_url
+            )
+        )
+    
+    if cameras:
+        _LOGGER.info(f"Добавление {len(cameras)} камер в Home Assistant")
+        async_add_entities(cameras, update_before_add=True)
+    else:
+        _LOGGER.warning("Не создано ни одной камеры")
 
-async def async_setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
-) -> None:
-    """Настройка камеры IS74 через YAML-конфигурацию."""
-    async_add_entities([IS74Camera(config)])
 
-async def get_cameras_info(session: aiohttp.ClientSession, token: str, group_id: str) -> list[dict] | None:
-    """Получает информацию о камерах."""
+async def _get_cameras_data(
+    session: aiohttp.ClientSession,
+    token: str,
+    group_id: str
+) -> list:
+    """Получение данных о камерах из API."""
     try:
+        url = f"{BASE_URL_CAM}/api/get-group/{group_id}"
         headers = {"Authorization": f"Bearer {token}"}
-        async with session.get(
-            f"https://cams.is74.ru/api/get-group/{group_id}",
-            headers=headers,
-        ) as response:
-            if response.status == 200:
-                return await response.json()
-            return None
-    except aiohttp.ClientError as err:
-        _LOGGER.error("Ошибка при получении информации о камерах: %s", err)
-        return None
+        
+        _LOGGER.debug(f"Запрос данных камер: {url}")
+        async with session.get(url, headers=headers) as resp:
+            _LOGGER.debug(f"Статус ответа API камер: {resp.status}")
+            if resp.status == 200:
+                data = await resp.json()
+                _LOGGER.info(f"Ответ API на камеры: {data}")
+                if isinstance(data, list):
+                    _LOGGER.info(f"Найдено камер: {len(data)}")
+                    return data
+                _LOGGER.warning(f"Неожиданный формат данных камер: {type(data)}, данные: {data}")
+            else:
+                response_text = await resp.text()
+                _LOGGER.error(f"Ошибка получения данных камер. Статус: {resp.status}, Ответ: {response_text}")
+    except Exception as e:
+        _LOGGER.error(f"Ошибка при получении данных камер: {e}", exc_info=True)
+    
+    return []
 
-class IS74Camera(Camera):
-    """Реализация камеры IS74."""
+class IntersvyazCamera(Camera):
+    """Камера Интерсвязь (WebRTC-ready)."""
+
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, config: dict[str, Any], token: str, camera_info: dict) -> None:
-        """Инициализация камеры IS74."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        token: str,
+        uuid: str,
+        name: str,
+        unique_id: str,
+        stream_url: Optional[str] = None,
+    ):
         super().__init__()
-        self._uuid: str = camera_info["UUID"]
-        self._name: str = camera_info["NAME"]
-        self._token: str = token
-        self._attr_unique_id = f"is74_camera_{self._uuid}"
-        self._input: str = (
-            f"https://cdn.cams.is74.ru/hls/playlists/multivariant.m3u8?uuid={self._uuid}&realtime=1&token=bearer-{self._token}"
+        self._hass = hass
+        self._token = token
+        self._uuid = uuid
+
+        self._attr_name = name
+        self._attr_unique_id = unique_id
+        self._attr_available = True
+
+        # Превью (snapshot)
+        self._attr_still_image_url = (
+            f"https://cdn.cams.is74.ru/snapshot"
+            f"?uuid={self._uuid}"
+            f"&token=bearer-{self._token}"
         )
-        
-        # Логируем URL потока
-        _LOGGER.info("Полученный URL потока камеры: %s", self._input)
 
-        # Добавляем информацию об устройстве
-        self._attr_device_info = {
-            "identifiers": {("intersvyaz_domofon", config.get("device_id", "main"))},
-            "name": "Домофон Интерсвязь",
-            "manufacturer": "Интерсвязь",
-            "model": "Домофон IS74",
-            "sw_version": "1.0",
-        }
+        self._stream_url = stream_url
 
-    async def stream_source(self) -> str:
-        """Возвращает источник потока."""
-        return self._input
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, "main")},
+            name="Домофон Интерсвязь",
+            manufacturer="Интерсвязь",
+            model="IS74",
+        )
+
+    async def async_stream_source(self) -> Optional[str]:
+        """Источник видеопотока для WebRTC (через go2rtc)."""
+        if self._stream_url:
+            return self._stream_url
+
+        return (
+            f"https://cdn.cams.is74.ru/hls/playlists/multivariant.m3u8"
+            f"?uuid={self._uuid}"
+            f"&token=bearer-{self._token}"
+        )
+
 
     async def async_camera_image(
-        self, width: int | None = None, height: int | None = None
-    ) -> bytes | None:
-        """Возвращает статичное изображение с камеры (не реализовано)."""
+        self, width: Optional[int] = None, height: Optional[int] = None
+    ) -> Optional[bytes]:
+        """Получение статического изображения с камеры."""
+        try:
+            session = async_get_clientsession(self._hass)
+            snapshot_url = (
+                f"https://cdn.cams.is74.ru/snapshot"
+                f"?uuid={self._uuid}"
+                f"&token=bearer-{self._token}"
+            )
+            _LOGGER.debug(f"Запрос snapshot для камеры {self._uuid}: {snapshot_url}")
+            async with session.get(
+                snapshot_url,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                else:
+                    _LOGGER.warning(f"Не удалось получить snapshot. Статус: {resp.status}")
+        except Exception as e:
+            _LOGGER.debug(f"Ошибка при получении snapshot для камеры {self._uuid}: {e}")
+        
         return None
 
-    @property
-    def name(self) -> str:
-        """Возвращает имя камеры."""
-        return self._name
+    async def async_update(self) -> None:
+        """Обновление состояния камеры."""
+        # Для HLS потоков проверка доступности через HEAD может быть ненадежной
+        # Камера считается доступной, если она была создана
+        # Home Assistant сам проверит доступность потока при попытке воспроизведения
+        pass
