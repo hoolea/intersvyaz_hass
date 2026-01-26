@@ -3,7 +3,7 @@ import aiohttp
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity import Entity, DeviceInfo
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import DOMAIN, open_door, get_token, get_relay_id
@@ -34,13 +34,13 @@ class DomofonButton(ButtonEntity):
         self._attr_unique_id = "domofon_button"
         
         # Добавляем информацию об устройстве
-        self._attr_device_info = {
-            "identifiers": {("intersvyaz_domofon", "main")},
-            "name": "Домофон Интерсвязь",
-            "manufacturer": "Интерсвязь",
-            "model": "Домофон IS74",
-            "sw_version": "1.0",
-        }
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, "main")},
+            name="Домофон Интерсвязь",
+            manufacturer="Интерсвязь",
+            model="Домофон IS74",
+            sw_version="1.0",
+        )
 
     async def async_press(self):
         """Обработчик нажатия кнопки."""
