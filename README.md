@@ -35,6 +35,7 @@
 4. После успешной авторизации появятся все **камеры с номерами подъездов** и  **кнопка "Открыть домофон"**
 
 ## Примечания
+- Для коректного отображения потока рекомендуется установить интеграцию [AlexxIT/WebRTC](https://github.com/AlexxIT/WebRTC).
 - Для работы необходим **доступ к интернету** и учетная запись Интерсвязи
 - Интеграция использует API: `https://api.is74.ru/auth/mobile`
 ## Настройка карточки
@@ -47,7 +48,7 @@ cards:
   - show_state: false
     show_name: false
     camera_view: live
-    type: picture-entity
+    type: custom:webrtc-camera
     entity: camera.is74_camera_6
   - show_name: true
     show_icon: false
