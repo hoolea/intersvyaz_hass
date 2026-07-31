@@ -1,295 +1,125 @@
+"""Интеграция Интерсвязь Домофон."""
+from __future__ import annotations
+
 import logging
-import aiohttp
+from datetime import timedelta
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.typing import ConfigType
-import uuid
-from typing import Optional
 from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 import homeassistant.helpers.config_validation as cv
 
-# Определение домена интеграции и базовых URL
-DOMAIN = "intersvyaz"
-BASE_URL = "https://api.is74.ru"
-BASE_URL_CAM = "https://cams.is74.ru"
+from .api import IntersvyazApiClient, IntersvyazApiError, IntersvyazAuthError
+from .const import (
+    CONF_SCAN_INTERVAL,
+    CONF_TOKEN,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+)
 
-# Логгер для отладки
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.CAMERA, Platform.BUTTON]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
+
+class IntersvyazDataUpdateCoordinator(DataUpdateCoordinator[dict]):
+    """Периодически обновляет список камер и подписанные ссылки на потоки.
+
+    ВАЖНО: ссылки на HLS-потоки в поле MEDIA ответа API подписаны и имеют
+    ограниченный срок жизни. Раньше они запрашивались один раз при старте
+    Home Assistant и сохранялись в атрибуте сущности камеры навсегда — из-за
+    этого воспроизведение видео переставало работать вскоре после
+    перезапуска, хотя снимок (snapshot) и кнопка открытия двери продолжали
+    работать, так как использовали долгоживущий Bearer-токен, а не
+    подписанную ссылку. Координатор устраняет эту проблему, регулярно
+    получая свежие данные.
+    """
+
+    def __init__(self, hass: HomeAssistant, client: IntersvyazApiClient, update_interval: int) -> None:
+        self.client = client
+        self.group_id: str | None = None
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=update_interval),
+        )
+
+    async def _async_update_data(self) -> dict[str, dict]:
+        try:
+            if not self.group_id:
+                self.group_id = await self.client.get_group_id()
+            cameras = await self.client.get_group_cameras(self.group_id)
+        except IntersvyazAuthError as err:
+            raise ConfigEntryAuthFailed("Токен недействителен, требуется повторный вход") from err
+        except IntersvyazApiError as err:
+            raise UpdateFailed(str(err)) from err
+
+        return {c["UUID"]: c for c in cameras if c.get("UUID")}
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Настройка интеграции."""
+    """Настройка интеграции (YAML не поддерживается)."""
     hass.data.setdefault(DOMAIN, {})
     return True
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Настройка интеграции для камеры и кнопки."""
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = entry.data
+    """Настройка записи конфигурации: клиент API, координатор, платформы."""
+    session = async_get_clientsession(hass)
 
-    # Настройка камеры и кнопки
-    await hass.config_entries.async_forward_entry_setups(entry, ["camera", "button"])
-    
+    token = entry.data.get(CONF_TOKEN)
+    if not token:
+        _LOGGER.error("Токен не найден в конфигурации")
+        return False
+
+    client = IntersvyazApiClient(session, token)
+    scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    coordinator = IntersvyazDataUpdateCoordinator(hass, client, scan_interval)
+
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except ConfigEntryAuthFailed:
+        raise
+    except UpdateFailed as err:
+        raise ConfigEntryNotReady(str(err)) from err
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = {
+        "client": client,
+        "coordinator": coordinator,
+    }
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    if not hass.services.has_service(DOMAIN, "open_door"):
+
+        async def handle_open_door(call: ServiceCall) -> None:
+            """Обработчик сервиса intersvyaz.open_door."""
+            relay_id = await client.get_relay_id()
+            await client.open_door(relay_id)
+
+        hass.services.async_register(DOMAIN, "open_door", handle_open_door)
+
     return True
 
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Перезагрузка записи при изменении опций (например, интервала обновления)."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Разгрузка конфигурационной записи."""
-    unload_ok = await hass.config_entries.async_forward_entry_unload(entry, "camera")
-    unload_ok_button = await hass.config_entries.async_forward_entry_unload(entry, "button")
-    
-    if unload_ok and unload_ok_button:
-        hass.data[DOMAIN].pop(entry.entry_id)
-    return unload_ok and unload_ok_button
-
-async def get_token(session: aiohttp.ClientSession, username: str, password: str) -> str | None:
-    """Получение токена авторизации."""
-    url = f"{BASE_URL}/auth/mobile"
-    payload = {"username": username, "password": password}
-    headers = {"Content-Type": "application/json"}
-    
-    try:
-        _LOGGER.debug(f"Отправка запроса авторизации для пользователя: {username}")
-        async with session.post(url, json=payload, headers=headers) as resp:
-            response_text = await resp.text()
-            _LOGGER.debug(f"Ответ сервера: {response_text}")
-            
-            if resp.status == 200:
-                try:
-                    data = await resp.json()
-                    if "TOKEN" in data:
-                        return data["TOKEN"]
-                    _LOGGER.error("Токен отсутствует в ответе")
-                except ValueError as e:
-                    _LOGGER.error(f"Ошибка разбора JSON ответа: {e}")
-            else:
-                _LOGGER.error(f"Ошибка авторизации. Статус: {resp.status}")
-    except aiohttp.ClientError as e:
-        _LOGGER.error(f"Ошибка сети при авторизации: {e}")
-    except Exception as e:
-        _LOGGER.error(f"Неожиданная ошибка при авторизации: {e}")
-    
-    return None
-
-async def get_relay_id(session: aiohttp.ClientSession, token: str) -> str | None:
-    """Получение ID реле."""
-    url = f"{BASE_URL}/domofon/relays"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    async with session.get(url, headers=headers) as resp:
-        data = await resp.json()
-        _LOGGER.info(f"Ответ API на relays: {data}")
-        
-        if isinstance(data, list) and data:
-            return data[0].get("RELAY_ID")
-        _LOGGER.error("API не вернул список реле!")
-    return None
-
-async def get_group_id(session: aiohttp.ClientSession, token: str) -> str | None:
-    """Получение ID группы с названием, начинающимся на 'Умный двор', или 'Свои камеры' через дополнительный запрос."""
-    # Первый запрос: ищем "Умный двор" по основному URL
-    url = f"{BASE_URL_CAM}/api/get-group/"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    async with session.get(url, headers=headers) as resp:
-        data = await resp.json()
-        _LOGGER.info(f"Ответ API на group (основной URL): {data}")
-        
-        # Проверяем наличие "Умный двор"
-        for group in data:
-            if group.get("NAME", "").startswith("Умный двор"):
-                _LOGGER.info(f"Найдена группа 'Умный двор' с ID: {group.get('ID')}")
-                return group.get("ID")
-        
-        _LOGGER.info("Группа 'Умный двор' не найдена в основном запросе, проверяем 'Свои камеры'")
-
-    # Второй запрос: ищем "Свои камеры" с параметром ?selfCams=true
-    url_self_cams = f"{BASE_URL_CAM}/api/get-group/?selfCams=true"
-    async with session.get(url_self_cams, headers=headers) as resp:
-        data = await resp.json()
-        _LOGGER.info(f"Ответ API на group (с ?selfCams=true): {data}")
-        
-        # Проверяем наличие "Свои камеры"
-        for group in data:
-            if group.get("NAME", "") == "Свои камеры":
-                _LOGGER.info(f"Найдена группа 'Свои камеры' с ID: {group.get('ID')}")
-                return group.get("ID")
-        
-        _LOGGER.error("Не найдены ни группа 'Умный двор', ни 'Свои камеры'!")
-    return None
-
-async def get_uuid_cam(session: aiohttp.ClientSession, token: str, group_id: str) -> list[str]:
-    """Получение списка UUID камер."""
-    url = f"{BASE_URL_CAM}/api/get-group/{group_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    async with session.get(url, headers=headers) as resp:
-        data = await resp.json()
-        _LOGGER.info(f"Ответ API на камеры: {data}")
-        
-        if isinstance(data, list) and data:
-            return [camera["UUID"] for camera in data if "UUID" in camera]
-        _LOGGER.error("API не вернул список UUID камер!")
-    return []
-
-async def open_door(session: aiohttp.ClientSession, token: str, relay_id: str) -> None:
-    """Открытие домофона."""
-    url = f"{BASE_URL}/domofon/relays/{relay_id}/open?from=app"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
-    async with session.post(url, headers=headers) as resp:
-        if resp.status == 200:
-            _LOGGER.info("Дверь успешно открыта")
-        else:
-            _LOGGER.error("Ошибка открытия двери")
-
-async def get_token_by_phone(
-    session: aiohttp.ClientSession, 
-    phone: str,
-    code: Optional[str] = None,
-    device_id: Optional[str] = None,
-    auth_id: Optional[str] = None,
-    user_id: Optional[str] = None,
-    skip_sms: bool = False
-) -> dict:
-    """Авторизация по номеру телефона."""
-    clean_phone = phone.replace("+7", "")
-    
-    if auth_id and user_id and skip_sms:
-        # Получение токена для выбранного адреса
-        url = f"{BASE_URL}/mobile/auth/get-token"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "authId": str(auth_id).strip(),
-            "userId": str(user_id).strip()
-        }
-        
-        _LOGGER.debug(f"Отправка запроса на получение токена: {payload}")
-        
-        try:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                response_text = await resp.text()
-                _LOGGER.debug(f"Ответ сервера при получении токена: {response_text}")
-                
-                if resp.status == 200:
-                    data = await resp.json()
-                    if "TOKEN" in data:
-                        return {"token": data["TOKEN"]}
-                
-                _LOGGER.error(f"Ошибка получения токена. Статус: {resp.status}, Ответ: {response_text}")
-                return {"error": "token_error"}
-                
-        except Exception as e:
-            _LOGGER.error(f"Ошибка при получении токена: {e}")
-            return {"error": "token_error"}
-    
-    if not code:
-        # Первый шаг - отправка СМС
-        device_id = str(uuid.uuid4()).replace("-", "")
-        url = f"{BASE_URL}/mobile/auth/send-sms"
-        payload = {
-            "phone": clean_phone,
-            "uniqueDeviceId": device_id
-        }
-        
-        _LOGGER.debug(f"Отправка запроса на SMS: {payload}")
-        async with session.post(url, json=payload) as resp:
-            response_text = await resp.text()
-            _LOGGER.debug(f"Ответ сервера: {response_text}")
-            
-            try:
-                data = await resp.json()
-                if resp.status != 200:
-                    error_message = data.get("message", "") if isinstance(data, dict) else str(data)
-                    return {"error": "sms_error", "message": error_message}
-                        
-                return {"device_id": device_id}
-            except Exception as e:
-                _LOGGER.error(f"Ошибка разбора ответа: {e}")
-                return {"error": "parse_error"}
-            
-    elif code and device_id and not auth_id:
-        # Второй шаг - подтверждение кода
-        url = f"{BASE_URL}/mobile/auth/confirm"
-        payload = {
-            "confirmCode": code,
-            "phone": clean_phone,
-            "uniqueDeviceId": device_id
-        }
-        
-        _LOGGER.debug(f"Отправка запроса подтверждения: {payload}")
-        async with session.post(url, json=payload) as resp:
-            response_text = await resp.text()
-            _LOGGER.debug(f"Ответ сервера при подтверждении: {response_text}")
-            
-            try:
-                data = await resp.json()
-                if "authId" in data and "addresses" in data:
-                    return {
-                        "auth_id": data["authId"],
-                        "addresses": data["addresses"]
-                    }
-                return {"error": "wrong_code"}
-            except Exception as e:
-                _LOGGER.error(f"Ошибка разбора ответа: {e}")
-                return {"error": "parse_error"}
-            
-    elif auth_id and user_id:
-        # Третий шаг - получение токена для выбранного адреса
-        url = f"{BASE_URL}/mobile/auth/get-token"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "authId": str(auth_id).strip(),
-            "userId": str(user_id).strip()
-        }
-        
-        _LOGGER.debug(f"Отправка запроса на получение токена:")
-        _LOGGER.debug(f"URL: {url}")
-        _LOGGER.debug(f"Headers: {headers}")
-        _LOGGER.debug(f"Payload: {payload}")
-        
-        try:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                response_text = await resp.text()
-                _LOGGER.debug(f"Статус ответа: {resp.status}")
-                _LOGGER.debug(f"Заголовки ответа: {resp.headers}")
-                _LOGGER.debug(f"Тело ответа: {response_text}")
-                
-                if resp.status != 200:
-                    _LOGGER.error(f"Ошибка HTTP: {resp.status}")
-                    return {"error": "http_error", "message": f"HTTP {resp.status}"}
-                
-                try:
-                    data = await resp.json()
-                    _LOGGER.debug(f"Разобранный JSON: {data}")
-                    
-                    if isinstance(data, dict):
-                        if "TOKEN" in data:
-                            _LOGGER.debug(f"Успешно получен токен: {data['TOKEN']}")
-                            return {"token": data["TOKEN"]}
-                        elif "token" in data:
-                            _LOGGER.debug(f"Успешно получен токен (lower case): {data['token']}")
-                            return {"token": data["token"]}
-                        else:
-                            _LOGGER.error(f"Токен отсутствует в ответе: {data}")
-                            return {"error": "no_token", "message": "Токен отсутствует в ответе"}
-                    else:
-                        _LOGGER.error(f"Неожиданный формат ответа: {data}")
-                        return {"error": "invalid_response", "message": "Неверный формат ответа"}
-                        
-                except ValueError as e:
-                    _LOGGER.error(f"Ошибка разбора JSON: {e}")
-                    return {"error": "parse_error", "message": str(e)}
-                    
-        except aiohttp.ClientError as e:
-            _LOGGER.error(f"Ошибка сети: {e}")
-            return {"error": "network_error", "message": str(e)}
-        except Exception as e:
-            _LOGGER.error(f"Неожиданная ошибка: {e}")
-            return {"error": "unknown_error", "message": str(e)}
-    
-    return {"error": "invalid_params", "message": "Неверные параметры запроса"}
+    """Выгрузка записи конфигурации."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        if not hass.data[DOMAIN]:
+            hass.services.async_remove(DOMAIN, "open_door")
+    return unload_ok

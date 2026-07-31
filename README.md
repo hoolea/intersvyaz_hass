@@ -33,6 +33,7 @@
 2. Найдите **Домофон Интерсвязь**
 3. Введите ваш **номер телефона** либо **логин** и **пароль** от личного кабинета Интерсвязь 
 4. После успешной авторизации появятся все **камеры с номерами подъездов** и  **кнопка "Открыть домофон"**
+5. Камеры необходимо пробросить в go2rtc так как провайдер отдает HLS поток с которым не дружит home-assistant. Для этого скопируйте конфигурацию go2rtc.yaml из логов интеграции.
 
 ## Примечания
 - Для коректного отображения потока рекомендуется установить интеграцию [AlexxIT/WebRTC](https://github.com/AlexxIT/WebRTC).
@@ -48,17 +49,19 @@ cards:
   - show_state: false
     show_name: false
     camera_view: live
-    type: custom:webrtc-camera
-    entity: camera.is74_camera_6
+    fit_mode: cover
+    type: picture-entity
+    entity: camera.podjezd
+    camera_image: camera.podjezd
   - show_name: true
     show_icon: false
     type: entity-button
-    entity: button.otkryt_domofon
     name: Открыть дверь
     icon: mdi:door-open
     show_state: false
     tap_action:
       action: toggle
+    entity: button.name
 ```
 
 ## Ошибки и предложения

@@ -1,55 +1,58 @@
+"""Button platform for Intersvyaz Domofon integration."""
+from __future__ import annotations
+
 import logging
-import aiohttp
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import Entity, DeviceInfo
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity import DeviceInfo
 
-from . import DOMAIN, open_door, get_token, get_relay_id
+from .api import IntersvyazApiClient, IntersvyazApiError
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
+) -> None:
     """Настройка кнопки в Home Assistant."""
-    session = async_get_clientsession(hass)
-    
-    # Получаем токен из сохраненных данных конфигурации
-    token = entry.data.get("token")
-    if not token:
-        _LOGGER.error("Токен не найден в конфигурации")
-        return
-    
-    # Создаем кнопку с сохраненными данными
-    async_add_entities([DomofonButton(hass, token)])
+    client: IntersvyazApiClient = hass.data[DOMAIN][entry.entry_id]["client"]
+    async_add_entities([DomofonButton(client)])
+
 
 class DomofonButton(ButtonEntity):
     """Кнопка открытия домофона."""
 
-    def __init__(self, hass: HomeAssistant, token: str):
-        """Инициализация кнопки."""
-        self._hass = hass
-        self._token = token
-        self._attr_name = "Открыть домофон"
-        self._attr_unique_id = "domofon_button"
-        
-        # Добавляем информацию об устройстве
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, "main")},
-            name="Домофон Интерсвязь",
-            manufacturer="Интерсвязь",
-            model="Домофон IS74",
-            sw_version="1.0",
-        )
+    _attr_name = "Открыть домофон"
+    _attr_unique_id = "domofon_button"
+    _attr_device_info = DeviceInfo(
+        identifiers={(DOMAIN, "main")},
+        name="Домофон Интерсвязь",
+        manufacturer="Интерсвязь",
+        model="Домофон IS74",
+    )
 
-    async def async_press(self):
+    def __init__(self, client: IntersvyazApiClient) -> None:
+        """Инициализация кнопки."""
+        self._client = client
+        self._relay_id: str | None = None
+
+    async def async_press(self) -> None:
         """Обработчик нажатия кнопки."""
-        session = async_get_clientsession(self._hass)
-        
-        # Получаем ID реле при каждом нажатии
-        relay_id = await get_relay_id(session, self._token)
-        if not relay_id:
-            _LOGGER.error("Не удалось получить ID реле")
-            return
-            
-        await open_door(session, self._token, relay_id)
+        try:
+            if not self._relay_id:
+                self._relay_id = await self._client.get_relay_id()
+            try:
+                await self._client.open_door(self._relay_id)
+            except IntersvyazApiError:
+                # ID реле мог измениться — один раз пробуем получить заново
+                self._relay_id = await self._client.get_relay_id()
+                await self._client.open_door(self._relay_id)
+        except IntersvyazApiError as err:
+            _LOGGER.error("Не удалось открыть домофон: %s", err)
+            raise HomeAssistantError(f"Не удалось открыть домофон: {err}") from err
+        else:
+            _LOGGER.info("Дверь успешно открыта")
