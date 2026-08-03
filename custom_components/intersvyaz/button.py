@@ -18,9 +18,19 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    """Настройка кнопки в Home Assistant."""
-    client: IntersvyazApiClient = hass.data[DOMAIN][entry.entry_id]["client"]
-    async_add_entities([DomofonButton(client, entry.title, entry.entry_id)])
+    """Настройка кнопок в Home Assistant (по одной на каждый адрес)."""
+    accounts: list[dict] = hass.data[DOMAIN][entry.entry_id]["accounts"]
+
+    buttons = [
+        DomofonButton(
+            account["client"],
+            account["address"],
+            account["device_identifier"],
+            f"domofon_button_{entry.entry_id}{account['unique_suffix']}",
+        )
+        for account in accounts
+    ]
+    async_add_entities(buttons)
 
 
 class DomofonButton(ButtonEntity):
@@ -28,13 +38,19 @@ class DomofonButton(ButtonEntity):
 
     _attr_has_entity_name = True
 
-    def __init__(self, client: IntersvyazApiClient, address: str, entry_id: str) -> None:
+    def __init__(
+        self,
+        client: IntersvyazApiClient,
+        address: str,
+        device_identifier: tuple[str, str],
+        unique_id: str,
+    ) -> None:
         self._client = client
         self._relay_id: str | None = None
         self._attr_name = "Открыть"
-        self._attr_unique_id = f"domofon_button_{entry_id}"
+        self._attr_unique_id = unique_id
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry_id)},
+            identifiers={device_identifier},
             name=address,
             manufacturer="Интерсвязь",
             model="Домофон IS74",

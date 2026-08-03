@@ -33,25 +33,32 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
     """Настройка камер в Home Assistant."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator: IntersvyazDataUpdateCoordinator = data["coordinator"]
-    client: IntersvyazApiClient = data["client"]
+    accounts: list[dict] = hass.data[DOMAIN][entry.entry_id]["accounts"]
 
-    if not coordinator.data:
+    cameras: list["IntersvyazCamera"] = []
+    for account in accounts:
+        coordinator: IntersvyazDataUpdateCoordinator = account["coordinator"]
+        client: IntersvyazApiClient = account["client"]
+
+        if not coordinator.data:
+            _LOGGER.warning("Не найдено камер для адреса %s", account["address"])
+            continue
+
+        cameras.extend(
+            IntersvyazCamera(
+                hass,
+                coordinator,
+                client,
+                uuid,
+                account["address"],
+                account["device_identifier"],
+            )
+            for uuid in coordinator.data
+        )
+
+    if not cameras:
         _LOGGER.warning("Не найдено камер для отображения")
         return
-
-    cameras = [
-        IntersvyazCamera(
-            hass,
-            coordinator,
-            client,
-            uuid,
-            entry.title,
-            entry.entry_id,
-        )
-        for uuid in coordinator.data
-    ]
 
     _LOGGER.info("Добавление %d камер в Home Assistant", len(cameras))
     async_add_entities(cameras)
@@ -121,7 +128,7 @@ class IntersvyazCamera(CoordinatorEntity[IntersvyazDataUpdateCoordinator], Camer
         client: IntersvyazApiClient,
         uuid: str,
         address: str,
-        entry_id: str,
+        device_identifier: tuple[str, str],
     ) -> None:
 
         CoordinatorEntity.__init__(self, coordinator)
@@ -138,7 +145,7 @@ class IntersvyazCamera(CoordinatorEntity[IntersvyazDataUpdateCoordinator], Camer
         self._attr_has_entity_name = True
 
         self._attr_device_info = DeviceInfo(
-        identifiers={(DOMAIN, entry_id)},
+        identifiers={device_identifier},
         name=address,
         manufacturer="Интерсвязь",
         model="Домофон IS74",

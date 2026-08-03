@@ -15,8 +15,12 @@ import homeassistant.helpers.config_validation as cv
 
 from .api import IntersvyazApiClient, IntersvyazApiError, IntersvyazAuthError
 from .const import (
+    CONF_ADDRESS,
+    CONF_ADDRESSES,
+    CONF_PRIMARY_USER_ID,
     CONF_SCAN_INTERVAL,
     CONF_TOKEN,
+    CONF_USER_ID,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
@@ -69,36 +73,123 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Настройка записи конфигурации: клиент API, координатор, платформы."""
-    session = async_get_clientsession(hass)
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Миграция записи конфигурации на новую схему (список адресов).
 
-    token = entry.data.get(CONF_TOKEN)
-    if not token:
-        _LOGGER.error("Токен не найден в конфигурации")
+    Раньше одна запись конфигурации содержала ровно один адрес (для
+    телефонной авторизации — CONF_ADDRESS/CONF_USER_ID/CONF_TOKEN прямо в
+    entry.data). Теперь одна запись может содержать несколько адресов
+    (CONF_ADDRESSES), чтобы можно было добавлять и удалять их через
+    Options Flow, не создавая отдельную интеграцию на каждый адрес.
+    Единственный адрес старой записи становится "основным" (CONF_PRIMARY_USER_ID),
+    благодаря чему у него сохраняется прежний device identifier и entity
+    unique_id, и апгрейд не создаёт для существующих пользователей дубликаты
+    устройств/сущностей.
+    """
+    if entry.version == 1:
+        data = dict(entry.data)
+        if CONF_ADDRESS in data and CONF_ADDRESSES not in data:
+            user_id = data.pop(CONF_USER_ID, None)
+            address = data.pop(CONF_ADDRESS, None)
+            token = data.pop(CONF_TOKEN, None)
+            data[CONF_ADDRESSES] = [
+                {CONF_ADDRESS: address, CONF_USER_ID: user_id, CONF_TOKEN: token}
+            ]
+            data[CONF_PRIMARY_USER_ID] = user_id
+
+        hass.config_entries.async_update_entry(entry, data=data, version=2)
+        _LOGGER.debug("Запись %s мигрирована на версию 2", entry.entry_id)
+
+    return True
+
+
+def _build_accounts(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    session,
+    scan_interval: int,
+) -> list[dict]:
+    """Построить список аккаунтов (клиент + координатор) для записи конфигурации.
+
+    Запись, созданная через авторизацию по телефону, может содержать
+    несколько адресов (CONF_ADDRESSES) — под каждый заводится свой клиент
+    API и координатор, так как у каждого адреса свой Bearer-токен и своя
+    группа камер. Запись, созданная через логин/пароль, по-прежнему
+    содержит ровно один адрес (без CONF_ADDRESSES).
+    """
+    addresses = entry.data.get(CONF_ADDRESSES)
+    primary_user_id = entry.data.get(CONF_PRIMARY_USER_ID)
+    accounts: list[dict] = []
+
+    if addresses:
+        for addr in addresses:
+            token = addr.get(CONF_TOKEN)
+            if not token:
+                continue
+            user_id = addr.get(CONF_USER_ID)
+            is_primary = user_id is not None and user_id == primary_user_id
+            client = IntersvyazApiClient(session, token)
+            coordinator = IntersvyazDataUpdateCoordinator(hass, client, scan_interval)
+            accounts.append(
+                {
+                    "client": client,
+                    "coordinator": coordinator,
+                    "address": addr.get(CONF_ADDRESS) or entry.title,
+                    "user_id": user_id,
+                    "device_identifier": (DOMAIN, entry.entry_id)
+                    if is_primary
+                    else (DOMAIN, f"{entry.entry_id}_{user_id}"),
+                    "unique_suffix": "" if is_primary else f"_{user_id}",
+                }
+            )
+    else:
+        token = entry.data.get(CONF_TOKEN)
+        if token:
+            client = IntersvyazApiClient(session, token)
+            coordinator = IntersvyazDataUpdateCoordinator(hass, client, scan_interval)
+            accounts.append(
+                {
+                    "client": client,
+                    "coordinator": coordinator,
+                    "address": entry.title,
+                    "user_id": None,
+                    "device_identifier": (DOMAIN, entry.entry_id),
+                    "unique_suffix": "",
+                }
+            )
+
+    return accounts
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Настройка записи конфигурации: клиенты API, координаторы, платформы."""
+    session = async_get_clientsession(hass)
+    scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+
+    accounts = _build_accounts(hass, entry, session, scan_interval)
+    if not accounts:
+        _LOGGER.error("Не найдено ни одного адреса в конфигурации")
         return False
 
-    client = IntersvyazApiClient(session, token)
-    scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    coordinator = IntersvyazDataUpdateCoordinator(hass, client, scan_interval)
-
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except ConfigEntryAuthFailed:
-        raise
-    except UpdateFailed as err:
-        raise ConfigEntryNotReady(str(err)) from err
+    for account in accounts:
+        try:
+            await account["coordinator"].async_config_entry_first_refresh()
+        except ConfigEntryAuthFailed:
+            raise
+        except UpdateFailed as err:
+            raise ConfigEntryNotReady(str(err)) from err
 
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = {
-        "client": client,
-        "coordinator": coordinator,
-    }
+    hass.data[DOMAIN][entry.entry_id] = {"accounts": accounts}
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     if not hass.services.has_service(DOMAIN, "open_door"):
+        # Сервис исторически привязан к первому обнаруженному аккаунту
+        # (см. кнопку "Открыть" у каждого устройства для точечного
+        # управления конкретным адресом/домофоном).
+        client = accounts[0]["client"]
 
         async def handle_open_door(call: ServiceCall) -> None:
             """Обработчик сервиса intersvyaz.open_door."""
