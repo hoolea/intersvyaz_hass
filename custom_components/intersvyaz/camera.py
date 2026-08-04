@@ -9,14 +9,20 @@ import aiohttp
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import IntersvyazDataUpdateCoordinator
 from .api import IntersvyazApiClient
-from .const import DOMAIN
+from .const import (
+    CONF_GO2RTC_ENABLED,
+    CONF_GO2RTC_URL,
+    DEFAULT_GO2RTC_ENABLED,
+    DEFAULT_GO2RTC_URL,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +33,111 @@ def _stream_name(name: str) -> str:
     name = re.sub(r"[^0-9a-zа-яё_]+", "_", name, flags=re.IGNORECASE)
     return name.strip("_")
 
+
+def _go2rtc_src(camera: "IntersvyazCamera") -> str | None:
+    """MSE-URL камеры в виде go2rtc-источника (flussonic:wss://...)."""
+    media = camera._camera_data.get("MEDIA", {})
+    mse_url = media.get("MSE", {}).get("LIVE") or camera._camera_data.get(
+        "REALTIME_WS", {}
+    ).get("combined")
+    if not mse_url:
+        return None
+
+    if mse_url.startswith("ws://"):
+        mse_url = "wss://" + mse_url[5:]
+    elif mse_url.startswith("http://"):
+        mse_url = "wss://" + mse_url[7:]
+    elif mse_url.startswith("https://"):
+        mse_url = "wss://" + mse_url[8:]
+
+    return f"flussonic:{mse_url}"
+
+
+async def _async_sync_go2rtc_streams(
+    hass: HomeAssistant, entry: ConfigEntry, cameras: list["IntersvyazCamera"]
+) -> None:
+    """Регистрирует/обновляет потоки камер в go2rtc через его REST API.
+
+    Вместо того чтобы просить пользователя вручную копировать блок
+    "streams:" в go2rtc.yaml, интеграция сама делает
+    PUT /api/streams?name=...&src=... на запущенный go2rtc. Это создаёт
+    поток, если его ещё нет, либо обновляет источник существующего —
+    без перезапуска go2rtc и без редактирования файлов конфигурации.
+    """
+    if not entry.options.get(CONF_GO2RTC_ENABLED, DEFAULT_GO2RTC_ENABLED):
+        return
+
+    base_url = (entry.options.get(CONF_GO2RTC_URL) or DEFAULT_GO2RTC_URL).rstrip("/")
+    session = async_get_clientsession(hass)
+
+    for camera in cameras:
+        src = _go2rtc_src(camera)
+        if not src:
+            continue
+
+        stream = _stream_name(camera.name)
+        try:
+            async with session.put(
+                f"{base_url}/api/streams",
+                params={"name": stream, "src": src},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    _LOGGER.warning(
+                        "go2rtc: не удалось зарегистрировать поток %s (HTTP %s): %s",
+                        stream,
+                        resp.status,
+                        text,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "go2rtc: поток %s зарегистрирован/обновлён (%s)", stream, base_url
+                    )
+        except aiohttp.ClientError as err:
+            _LOGGER.warning(
+                "go2rtc: не удалось подключиться к %s (%s). Проверьте, что go2rtc "
+                "запущен и адрес указан верно в настройках интеграции "
+                "(Настройки → Интервал обновления)",
+                base_url,
+                err,
+            )
+            return  # сервер недоступен — нет смысла пробовать оставшиеся камеры
+
+
+def _log_manual_go2rtc_block(cameras: list["IntersvyazCamera"]) -> None:
+    """Выводит блок для ручного копирования в go2rtc.yaml (запасной вариант)."""
+    _LOGGER.info("")
+    _LOGGER.info("=" * 72)
+    _LOGGER.info(
+        "Автоматическая регистрация в go2rtc отключена или недоступна. "
+        "Скопируйте блок ниже в go2rtc.yaml"
+    )
+    _LOGGER.info("")
+    _LOGGER.info("streams:")
+
+    rtsp_urls: list[str] = []
+    for camera in cameras:
+        src = _go2rtc_src(camera)
+        if not src:
+            continue
+        stream = _stream_name(camera.name)
+        _LOGGER.info("  %s:", stream)
+        _LOGGER.info('    - "%s"', src)
+        rtsp_urls.append(f"rtsp://127.0.0.1:8554/{stream}")
+
+    if rtsp_urls:
+        _LOGGER.info("")
+        _LOGGER.info("After restarting go2rtc the streams will be available as:")
+        _LOGGER.info("")
+        for url in rtsp_urls:
+            _LOGGER.info("  %s", url)
+    else:
+        _LOGGER.info("")
+        _LOGGER.info("No MSE streams were returned by API.")
+
+    _LOGGER.info("=" * 72)
+    _LOGGER.info("")
 
 
 async def async_setup_entry(
@@ -44,7 +155,7 @@ async def async_setup_entry(
             _LOGGER.warning("Не найдено камер для адреса %s", account["address"])
             continue
 
-        cameras.extend(
+        account_cameras = [
             IntersvyazCamera(
                 hass,
                 coordinator,
@@ -54,7 +165,20 @@ async def async_setup_entry(
                 account["device_identifier"],
             )
             for uuid in coordinator.data
-        )
+        ]
+        cameras.extend(account_cameras)
+
+        # При каждом обновлении координатора (в т.ч. из-за смены токена в
+        # подписанных MSE-ссылках) заново регистрируем потоки в go2rtc.
+        @callback
+        def _schedule_resync(
+            _account_cameras: list["IntersvyazCamera"] = account_cameras,
+        ) -> None:
+            hass.async_create_task(
+                _async_sync_go2rtc_streams(hass, entry, _account_cameras)
+            )
+
+        entry.async_on_unload(coordinator.async_add_listener(_schedule_resync))
 
     if not cameras:
         _LOGGER.warning("Не найдено камер для отображения")
@@ -63,47 +187,10 @@ async def async_setup_entry(
     _LOGGER.info("Добавление %d камер в Home Assistant", len(cameras))
     async_add_entities(cameras)
 
-    _LOGGER.info("")
-    _LOGGER.info("=" * 72)
-    _LOGGER.info("Copy this block into go2rtc.yaml")
-    _LOGGER.info("")
-    _LOGGER.info("streams:")
-
-    rtsp_urls: list[str] = []
-
-    for camera in cameras:
-        media = camera._camera_data.get("MEDIA", {})
-        mse_url = (
-            media.get("MSE", {}).get("LIVE")
-            or camera._camera_data.get("REALTIME_WS", {}).get("combined")
-        )
-        if not mse_url:
-            continue
-        if mse_url.startswith("ws://"):
-            mse_url = "wss://" + mse_url[5:]
-        elif mse_url.startswith("http://"):
-            mse_url = "wss://" + mse_url[7:]
-        elif mse_url.startswith("https://"):
-            mse_url = "wss://" + mse_url[8:]
-
-        stream = _stream_name(camera.name)
-
-        _LOGGER.info("  %s:", stream)
-        _LOGGER.info('    - "flussonic:%s"', mse_url)
-        rtsp_urls.append(f"rtsp://127.0.0.1:8554/{stream}")
-
-    if rtsp_urls:
-        _LOGGER.info("")
-        _LOGGER.info("After restarting go2rtc the streams will be available as:")
-        _LOGGER.info("")
-        for url in rtsp_urls:
-            _LOGGER.info("  %s", url)
+    if entry.options.get(CONF_GO2RTC_ENABLED, DEFAULT_GO2RTC_ENABLED):
+        await _async_sync_go2rtc_streams(hass, entry, cameras)
     else:
-        _LOGGER.info("")
-        _LOGGER.info("No MSE streams were returned by API.")
-
-    _LOGGER.info("=" * 72)
-    _LOGGER.info("")
+        _log_manual_go2rtc_block(cameras)
 
 
 class IntersvyazCamera(CoordinatorEntity[IntersvyazDataUpdateCoordinator], Camera):

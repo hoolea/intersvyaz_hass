@@ -37,3 +37,9 @@ BASE_URL_CDN = "https://cdn.cams.is74.ru"
 DEFAULT_SCAN_INTERVAL = 120  # секунд
 MIN_SCAN_INTERVAL = 30
 MAX_SCAN_INTERVAL = 3600
+
+# Автоматическая регистрация потоков в go2rtc через его REST API
+CONF_GO2RTC_ENABLED = "go2rtc_enabled"
+CONF_GO2RTC_URL = "go2rtc_url"
+DEFAULT_GO2RTC_ENABLED = True
+DEFAULT_GO2RTC_URL = "http://127.0.0.1:1984"

@@ -22,6 +22,8 @@ from .const import (
     CONF_AUTH_ID,
     CONF_AUTH_METHOD,
     CONF_DEVICE_ID,
+    CONF_GO2RTC_ENABLED,
+    CONF_GO2RTC_URL,
     CONF_PASSWORD,
     CONF_PHONE,
     CONF_PRIMARY_USER_ID,
@@ -30,6 +32,8 @@ from .const import (
     CONF_TOKEN,
     CONF_USERNAME,
     CONF_USER_ID,
+    DEFAULT_GO2RTC_ENABLED,
+    DEFAULT_GO2RTC_URL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     MAX_SCAN_INTERVAL,
@@ -267,18 +271,26 @@ class DomofonOptionsFlow(config_entries.OptionsFlow):
         )
 
     async def async_step_settings(self, user_input: dict[str, Any] | None = None):
-        """Интервал обновления данных о камерах."""
+        """Интервал обновления данных о камерах и настройки go2rtc."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = self.config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        current_scan = self.config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        current_go2rtc_enabled = self.config_entry.options.get(
+            CONF_GO2RTC_ENABLED, DEFAULT_GO2RTC_ENABLED
+        )
+        current_go2rtc_url = self.config_entry.options.get(CONF_GO2RTC_URL, DEFAULT_GO2RTC_URL)
         return self.async_show_form(
             step_id="settings",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_SCAN_INTERVAL, default=current): vol.All(
+                    vol.Required(CONF_SCAN_INTERVAL, default=current_scan): vol.All(
                         vol.Coerce(int), vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL)
-                    )
+                    ),
+                    vol.Required(
+                        CONF_GO2RTC_ENABLED, default=current_go2rtc_enabled
+                    ): bool,
+                    vol.Required(CONF_GO2RTC_URL, default=current_go2rtc_url): str,
                 }
             ),
         )
