@@ -136,6 +136,27 @@ class IntersvyazApiClient:
     # ------------------------------------------------------------------ #
     # Домофон / реле
     # ------------------------------------------------------------------ #
+    async def get_relays(self) -> list[dict]:
+        """Вернуть все доступные реле с уникальными нормализованными ID."""
+        data = await self._request("GET", f"{BASE_URL}/domofon/relays", auth=True)
+        if not isinstance(data, list):
+            raise IntersvyazApiError("API не вернул список реле")
+
+        relays: list[dict] = []
+        seen: set[str] = set()
+        for relay in data:
+            if not isinstance(relay, dict):
+                continue
+            value = relay.get("RELAY_ID")
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                continue
+            relay_id = str(value).strip()
+            if not relay_id.isascii() or not relay_id.isdecimal() or relay_id in seen:
+                continue
+            seen.add(relay_id)
+            relays.append({**relay, "RELAY_ID": relay_id})
+        return relays
+
     async def get_relay_id(self) -> str:
         data = await self._request("GET", f"{BASE_URL}/domofon/relays", auth=True)
         if isinstance(data, list) and data:
