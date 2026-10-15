@@ -11,7 +11,8 @@ from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import IntersvyazDataUpdateCoordinator
@@ -34,12 +35,16 @@ def _stream_name(name: str) -> str:
     return name.strip("_")
 
 
+def _mse_url(camera_data: dict) -> str | None:
+    media = camera_data.get("MEDIA") or {}
+    return (media.get("MSE") or {}).get("LIVE") or (
+        camera_data.get("REALTIME_WS") or {}
+    ).get("combined")
+
+
 def _go2rtc_src(camera: "IntersvyazCamera") -> str | None:
     """MSE-URL камеры в виде go2rtc-источника (flussonic:wss://...)."""
-    media = camera._camera_data.get("MEDIA", {})
-    mse_url = media.get("MSE", {}).get("LIVE") or camera._camera_data.get(
-        "REALTIME_WS", {}
-    ).get("combined")
+    mse_url = _mse_url(camera._camera_data)
     if not mse_url:
         return None
 
@@ -75,7 +80,7 @@ async def _async_sync_go2rtc_streams(
         if not src:
             continue
 
-        stream = _stream_name(camera.name)
+        stream = camera.go2rtc_stream
         try:
             async with session.put(
                 f"{base_url}/api/streams",
@@ -121,7 +126,7 @@ def _log_manual_go2rtc_block(cameras: list["IntersvyazCamera"]) -> None:
         src = _go2rtc_src(camera)
         if not src:
             continue
-        stream = _stream_name(camera.name)
+        stream = camera.go2rtc_stream
         _LOGGER.info("  %s:", stream)
         _LOGGER.info('    - "%s"', src)
         rtsp_urls.append(f"rtsp://127.0.0.1:8554/{stream}")
@@ -140,54 +145,142 @@ def _log_manual_go2rtc_block(cameras: list["IntersvyazCamera"]) -> None:
     _LOGGER.info("")
 
 
+_CLAIMS_KEY = f"{DOMAIN}_camera_claims"
+
+
+def _claims(hass: HomeAssistant) -> dict[str, dict[str, str]]:
+    """Общий для всех записей реестр занятых unique_id и имён потоков go2rtc.
+
+    Одна и та же камера «Умного двора» видна с нескольких адресов (соседние
+    квартиры, квартира + дача в одном доме и т.п.). Раньше у неё был
+    unique_id "intersvyaz_camera_<uuid>" для каждого адреса — второй экземпляр
+    Home Assistant отбрасывал с ошибкой о неуникальном ID. Аналогично
+    одноимённые камеры («Подъезд 1») с разных адресов перезаписывали друг
+    друга в go2rtc.
+    Значение: {"unique_ids": {unique_id: owner}, "streams": {name: owner}},
+    где owner = "<entry_id>/<device identifier>".
+    """
+    return hass.data.setdefault(_CLAIMS_KEY, {"unique_ids": {}, "streams": {}})
+
+
+def _release_claims(hass: HomeAssistant, entry_id: str) -> None:
+    claims = _claims(hass)
+    for table in claims.values():
+        for key in [k for k, owner in table.items() if owner.startswith(f"{entry_id}/")]:
+            table.pop(key)
+
+
+def _camera_unique_id(
+    hass: HomeAssistant, entry: ConfigEntry, account: dict, uuid: str
+) -> str:
+    """unique_id камеры, совместимый со старыми установками.
+
+    Первый адрес, у которого встретилась камера, сохраняет прежний ID
+    "intersvyaz_camera_<uuid>" (сущность и её история не меняются).
+    Остальные адреса получают ID с суффиксом записи и адреса.
+    """
+    owner = f"{entry.entry_id}/{account['device_identifier'][1]}"
+    legacy = f"intersvyaz_camera_{uuid}"
+    suffixed = f"{legacy}_{entry.entry_id}{account['unique_suffix']}"
+    claimed = _claims(hass)["unique_ids"]
+
+    if claimed.get(legacy, owner) != owner:
+        claimed[suffixed] = owner
+        return suffixed
+
+    # Если старый ID уже есть в реестре сущностей, он принадлежит тому
+    # адресу (устройству), к которому сущность была привязана изначально.
+    ent_reg = er.async_get(hass)
+    entity_id = ent_reg.async_get_entity_id("camera", DOMAIN, legacy)
+    if entity_id:
+        reg_entry = ent_reg.async_get(entity_id)
+        device = dr.async_get(hass).async_get_device(
+            identifiers={account["device_identifier"]}
+        )
+        # Устройства этого адреса может ещё не быть (платформы кнопок и
+        # камер поднимаются параллельно) — тогда сущность, уже привязанная к
+        # какому-то устройству, точно принадлежит другому адресу.
+        owned = reg_entry.config_entry_id == entry.entry_id and (
+            reg_entry.device_id is None
+            or (device is not None and reg_entry.device_id == device.id)
+        )
+        if not owned:
+            claimed[suffixed] = owner
+            return suffixed
+
+    claimed[legacy] = owner
+    return legacy
+
+
+def _go2rtc_stream_name(
+    hass: HomeAssistant, entry: ConfigEntry, account: dict, uuid: str, name: str
+) -> str:
+    """Уникальное имя потока go2rtc; для уникальных камер — как раньше."""
+    owner = f"{entry.entry_id}/{account['device_identifier'][1]}/{uuid}"
+    streams = _claims(hass)["streams"]
+    stream = _stream_name(name) or f"intersvyaz_{uuid[:8]}"
+    if streams.get(stream, owner) != owner:
+        stream = f"{stream}_{uuid[:8]}"
+    if streams.get(stream, owner) != owner:
+        stream = f"{stream}_{account['device_identifier'][1][-8:]}"
+    streams[stream] = owner
+    return stream
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
     """Настройка камер в Home Assistant."""
     accounts: list[dict] = hass.data[DOMAIN][entry.entry_id]["accounts"]
+    entry.async_on_unload(lambda: _release_claims(hass, entry.entry_id))
+    go2rtc_enabled = entry.options.get(CONF_GO2RTC_ENABLED, DEFAULT_GO2RTC_ENABLED)
 
     cameras: list["IntersvyazCamera"] = []
     for account in accounts:
         coordinator: IntersvyazDataUpdateCoordinator = account["coordinator"]
-        client: IntersvyazApiClient = account["client"]
+        if not coordinator.cameras:
+            _LOGGER.debug("У адреса %s нет камер", account["address"])
 
-        if not coordinator.data:
-            _LOGGER.warning("Не найдено камер для адреса %s", account["address"])
-            continue
+        account_cameras: list["IntersvyazCamera"] = []
 
-        account_cameras = [
-            IntersvyazCamera(
-                hass,
-                coordinator,
-                client,
-                uuid,
-                account["address"],
-                account["device_identifier"],
-            )
-            for uuid in coordinator.data
-        ]
-        cameras.extend(account_cameras)
-
-        # При каждом обновлении координатора (в т.ч. из-за смены токена в
-        # подписанных MSE-ссылках) заново регистрируем потоки в go2rtc.
         @callback
-        def _schedule_resync(
+        def _add_new_cameras(
+            _account: dict = account,
+            _coordinator: IntersvyazDataUpdateCoordinator = coordinator,
             _account_cameras: list["IntersvyazCamera"] = account_cameras,
+            _initial: bool = False,
         ) -> None:
-            hass.async_create_task(
-                _async_sync_go2rtc_streams(hass, entry, _account_cameras)
-            )
+            known = {c.uuid for c in _account_cameras}
+            new = [
+                IntersvyazCamera(hass, entry, _coordinator, _account, uuid)
+                for uuid in _coordinator.cameras
+                if uuid not in known
+            ]
+            _account_cameras.extend(new)
+            if _initial:
+                cameras.extend(new)
+                return
+            if new:
+                _LOGGER.info("Найдено новых камер: %d", len(new))
+                async_add_entities(new)
+            # При каждом обновлении (подписанные MSE-ссылки меняются) заново
+            # регистрируем потоки этого адреса в go2rtc.
+            if go2rtc_enabled:
+                hass.async_create_task(
+                    _async_sync_go2rtc_streams(hass, entry, list(_account_cameras))
+                )
 
-        entry.async_on_unload(coordinator.async_add_listener(_schedule_resync))
+        _add_new_cameras(_initial=True)
+        entry.async_on_unload(coordinator.async_add_listener(_add_new_cameras))
 
     if not cameras:
-        _LOGGER.warning("Не найдено камер для отображения")
+        _LOGGER.info("Камер для отображения пока нет")
         return
 
     _LOGGER.info("Добавление %d камер в Home Assistant", len(cameras))
     async_add_entities(cameras)
 
-    if entry.options.get(CONF_GO2RTC_ENABLED, DEFAULT_GO2RTC_ENABLED):
+    if go2rtc_enabled:
         await _async_sync_go2rtc_streams(hass, entry, cameras)
     else:
         _log_manual_go2rtc_block(cameras)
@@ -208,45 +301,46 @@ class IntersvyazCamera(CoordinatorEntity[IntersvyazDataUpdateCoordinator], Camer
     # allowed_extensions=ALL отключает эту проверку.
     _attr_stream_options = {"allowed_extensions": "ALL"}
 
+    # Подписанная ссылка меняется при каждом обновлении и содержит токен —
+    # хранить её в истории (recorder) бессмысленно и небезопасно.
+    _unrecorded_attributes = frozenset({"mse_url"})
+
     def __init__(
         self,
         hass: HomeAssistant,
+        entry: ConfigEntry,
         coordinator: IntersvyazDataUpdateCoordinator,
-        client: IntersvyazApiClient,
+        account: dict,
         uuid: str,
-        address: str,
-        device_identifier: tuple[str, str],
     ) -> None:
 
         CoordinatorEntity.__init__(self, coordinator)
         Camera.__init__(self)
         self._hass = hass
-        self._client = client
+        self._client: IntersvyazApiClient = account["client"]
+        self.uuid = uuid
         self._uuid = uuid
 
-        camera_data = coordinator.data.get(uuid, {})
+        camera_data = coordinator.cameras.get(uuid, {})
         self._attr_name = (
             camera_data.get("NAME") or camera_data.get("TITLE") or f"Камера {uuid[:8]}"
         )
-        self._attr_unique_id = f"intersvyaz_camera_{uuid}"
+        self._attr_unique_id = _camera_unique_id(hass, entry, account, uuid)
         self._attr_has_entity_name = True
-
-        self._attr_device_info = DeviceInfo(
-        identifiers={device_identifier},
-        name=address,
-        manufacturer="Интерсвязь",
-        model="Домофон IS74",
+        self.go2rtc_stream = _go2rtc_stream_name(
+            hass, entry, account, uuid, self._attr_name
         )
 
-        _LOGGER.debug(
-            "Камера %s создана, supported_features=%s",
-            self._attr_unique_id,
-            self._attr_supported_features,
+        self._attr_device_info = DeviceInfo(
+            identifiers={account["device_identifier"]},
+            name=account["address"],
+            manufacturer="Интерсвязь",
+            model="Домофон IS74",
         )
 
     @property
     def _camera_data(self) -> dict:
-        return self.coordinator.data.get(self._uuid, {}) if self.coordinator.data else {}
+        return self.coordinator.cameras.get(self._uuid, {})
 
     @property
     def available(self) -> bool:
@@ -263,11 +357,8 @@ class IntersvyazCamera(CoordinatorEntity[IntersvyazDataUpdateCoordinator], Camer
         Обновляется вместе с координатором, дополнительных запросов к API
         не требует.
         """
-        media = self._camera_data.get("MEDIA", {})
-        mse_url = media.get("MSE", {}).get("LIVE") or self._camera_data.get(
-            "REALTIME_WS", {}
-        ).get("combined")
-        attrs: dict = {"uuid": self._uuid}
+        mse_url = _mse_url(self._camera_data)
+        attrs: dict = {"uuid": self._uuid, "go2rtc_stream": self.go2rtc_stream}
         if mse_url:
             attrs["mse_url"] = mse_url
         return attrs
@@ -289,36 +380,36 @@ class IntersvyazCamera(CoordinatorEntity[IntersvyazDataUpdateCoordinator], Camer
             self._uuid,
             self.available,
             self.coordinator.last_update_success,
-            self._uuid in (self.coordinator.data or {}),
+            self._uuid in self.coordinator.cameras,
         )
         try:
-            if not self.coordinator.last_update_success or self._uuid not in (
-                self.coordinator.data or {}
+            if (
+                not self.coordinator.last_update_success
+                or self._uuid not in self.coordinator.cameras
             ):
                 await self.coordinator.async_request_refresh()
 
             media = self._camera_data.get("MEDIA", {})
             live = media.get("HLS", {}).get("LIVE", {})
-            _LOGGER.debug("Камера %s: варианты потока от API: %s", self._uuid, live)
+            _LOGGER.debug(
+                "Камера %s: варианты потока от API: %s", self._uuid, sorted(live)
+            )
 
             if live:
                 url = live.get("MAIN") or live.get("LOW_LATENCY")
                 if url:
                     variant = "MAIN" if live.get("MAIN") else "LOW_LATENCY"
-                    _LOGGER.info(
-                        "Камера %s: используется вариант потока %s: %s",
-                        self._uuid,
-                        variant,
-                        url,
+                    # Сам URL не логируем: он подписан и содержит токен.
+                    _LOGGER.debug(
+                        "Камера %s: используется вариант потока %s", self._uuid, variant
                     )
                     return url
 
             if self._client.token:
                 url = self._client.fallback_stream_url(self._uuid)
-                _LOGGER.info(
-                    "Камера %s: используется резервный (fallback) URL потока: %s",
+                _LOGGER.debug(
+                    "Камера %s: используется резервный (fallback) URL потока",
                     self._uuid,
-                    url,
                 )
                 return url
 

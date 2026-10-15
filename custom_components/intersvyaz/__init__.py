@@ -2,18 +2,31 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+
+import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 import homeassistant.helpers.config_validation as cv
+from homeassistant.util import dt as dt_util
 
-from .api import IntersvyazApiClient, IntersvyazApiError, IntersvyazAuthError
+from .api import (
+    IntersvyazApiClient,
+    IntersvyazApiError,
+    IntersvyazAuthError,
+    IntersvyazNoCamerasError,
+)
 from .const import (
     CONF_ADDRESS,
     CONF_ADDRESSES,
@@ -31,22 +44,30 @@ PLATFORMS = [Platform.CAMERA, Platform.BUTTON]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
+GROUPS_REFRESH_INTERVAL = timedelta(hours=1)
+SERVICE_OPEN_DOOR = "open_door"
+ATTR_RELAY_ID = "relay_id"
+
+OPEN_DOOR_SCHEMA = vol.Schema({vol.Optional(ATTR_RELAY_ID): vol.All(cv.string, vol.Strip)})
+
+
 class IntersvyazDataUpdateCoordinator(DataUpdateCoordinator[dict]):
-    """Периодически обновляет список камер и подписанные ссылки на потоки.
+    """Периодически обновляет камеры (с подписанными ссылками) и список реле.
 
     ВАЖНО: ссылки на HLS-потоки в поле MEDIA ответа API подписаны и имеют
-    ограниченный срок жизни. Раньше они запрашивались один раз при старте
-    Home Assistant и сохранялись в атрибуте сущности камеры навсегда — из-за
-    этого воспроизведение видео переставало работать вскоре после
-    перезапуска, хотя снимок (snapshot) и кнопка открытия двери продолжали
-    работать, так как использовали долгоживущий Bearer-токен, а не
-    подписанную ссылку. Координатор устраняет эту проблему, регулярно
-    получая свежие данные.
+    ограниченный срок жизни, поэтому их нужно регулярно перезапрашивать.
+
+    Формат self.data:
+        {
+            "cameras": {uuid: <данные камеры>, ...},
+            "relays": {relay_id: <данные реле>, ...},   # порядок как в API
+        }
     """
 
     def __init__(self, hass: HomeAssistant, client: IntersvyazApiClient, update_interval: int) -> None:
         self.client = client
-        self.group_id: str | None = None
+        self.group_ids: list[str] | None = None
+        self._groups_fetched_at: datetime | None = None
         super().__init__(
             hass,
             _LOGGER,
@@ -54,22 +75,102 @@ class IntersvyazDataUpdateCoordinator(DataUpdateCoordinator[dict]):
             update_interval=timedelta(seconds=update_interval),
         )
 
+    @property
+    def cameras(self) -> dict[str, dict]:
+        return (self.data or {}).get("cameras", {})
+
+    @property
+    def relays(self) -> dict[str, dict]:
+        return (self.data or {}).get("relays", {})
+
+    async def _async_fetch_cameras(self) -> dict[str, dict]:
+        now = dt_util.utcnow()
+        if (
+            self.group_ids is None
+            or self._groups_fetched_at is None
+            or now - self._groups_fetched_at > GROUPS_REFRESH_INTERVAL
+        ):
+            try:
+                self.group_ids = await self.client.get_group_ids()
+            except IntersvyazNoCamerasError:
+                # Домофон без видео — это не ошибка, кнопки всё равно нужны.
+                self.group_ids = []
+            self._groups_fetched_at = now
+
+        cameras = await self.client.get_cameras(self.group_ids)
+        return {c["UUID"]: c for c in cameras}
+
+    async def _async_fetch_relays(self) -> dict[str, dict]:
+        try:
+            relays = await self.client.get_relays()
+        except IntersvyazAuthError:
+            raise
+        except IntersvyazApiError as err:
+            # Реле меняются редко: при временной ошибке оставляем прежний
+            # список, чтобы кнопки не становились недоступными из-за сбоя
+            # одного запроса.
+            _LOGGER.debug("Не удалось обновить список реле: %s", err)
+            return self.relays
+        return {r["RELAY_ID"]: r for r in relays}
+
     async def _async_update_data(self) -> dict[str, dict]:
         try:
-            if not self.group_id:
-                self.group_id = await self.client.get_group_id()
-            cameras = await self.client.get_group_cameras(self.group_id)
+            cameras = await self._async_fetch_cameras()
+            relays = await self._async_fetch_relays()
         except IntersvyazAuthError as err:
             raise ConfigEntryAuthFailed("Токен недействителен, требуется повторный вход") from err
         except IntersvyazApiError as err:
+            # Если список групп устарел (группу удалили), перезапросим его.
+            self.group_ids = None
             raise UpdateFailed(str(err)) from err
 
-        return {c["UUID"]: c for c in cameras if c.get("UUID")}
+        return {"cameras": cameras, "relays": relays}
+
+
+def _iter_accounts(hass: HomeAssistant):
+    for entry_data in hass.data.get(DOMAIN, {}).values():
+        if isinstance(entry_data, dict):
+            yield from entry_data.get("accounts", [])
+
+
+async def _async_handle_open_door(call: ServiceCall) -> None:
+    """intersvyaz.open_door [relay_id].
+
+    Без relay_id открывается первое реле первого адреса (как раньше).
+    С relay_id — конкретное реле любого из подключённых адресов.
+    """
+    hass = call.hass
+    accounts = list(_iter_accounts(hass))
+    if not accounts:
+        raise HomeAssistantError("Интеграция Интерсвязь не настроена")
+
+    relay_id = call.data.get(ATTR_RELAY_ID)
+    try:
+        if relay_id:
+            for account in accounts:
+                if relay_id in account["coordinator"].relays:
+                    await account["client"].open_door(relay_id)
+                    return
+            raise ServiceValidationError(
+                f"Реле {relay_id} не найдено ни у одного подключённого адреса"
+            )
+        client: IntersvyazApiClient = accounts[0]["client"]
+        await client.open_door(await client.get_relay_id())
+    except IntersvyazApiError as err:
+        raise HomeAssistantError(f"Не удалось открыть домофон: {err}") from err
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Настройка интеграции (YAML не поддерживается)."""
+    """Настройка интеграции (YAML не поддерживается).
+
+    Сервис регистрируется один раз здесь, а не в async_setup_entry: раньше
+    он замыкал клиента первой записи и после её выгрузки/перезагрузки
+    продолжал использовать устаревший объект (или пропадал совсем).
+    """
     hass.data.setdefault(DOMAIN, {})
+    hass.services.async_register(
+        DOMAIN, SERVICE_OPEN_DOOR, _async_handle_open_door, schema=OPEN_DOOR_SCHEMA
+    )
     return True
 
 
@@ -185,19 +286,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
-    if not hass.services.has_service(DOMAIN, "open_door"):
-        # Сервис исторически привязан к первому обнаруженному аккаунту
-        # (см. кнопку "Открыть" у каждого устройства для точечного
-        # управления конкретным адресом/домофоном).
-        client = accounts[0]["client"]
-
-        async def handle_open_door(call: ServiceCall) -> None:
-            """Обработчик сервиса intersvyaz.open_door."""
-            relay_id = await client.get_relay_id()
-            await client.open_door(relay_id)
-
-        hass.services.async_register(DOMAIN, "open_door", handle_open_door)
-
     return True
 
 
@@ -211,6 +299,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
-        if not hass.data[DOMAIN]:
-            hass.services.async_remove(DOMAIN, "open_door")
     return unload_ok

@@ -16,9 +16,7 @@ import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
-BASE_URL = "https://api.is74.ru"
-BASE_URL_CAM = "https://cams.is74.ru"
-BASE_URL_CDN = "https://cdn.cams.is74.ru"
+from .const import BASE_URL, BASE_URL_CAM, BASE_URL_CDN
 
 API_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
@@ -26,9 +24,17 @@ API_TIMEOUT = aiohttp.ClientTimeout(total=15)
 class IntersvyazApiError(Exception):
     """Базовая ошибка при обращении к API Интерсвязь."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class IntersvyazAuthError(IntersvyazApiError):
     """Токен недействителен/истёк или неверные учётные данные."""
+
+
+class IntersvyazNoCamerasError(IntersvyazApiError):
+    """У адреса нет ни одной группы камер (домофон без видео)."""
 
 
 class IntersvyazApiClient:
@@ -58,11 +64,14 @@ class IntersvyazApiClient:
 
                 if resp.status in (401, 403):
                     raise IntersvyazAuthError(
-                        f"Ошибка авторизации ({resp.status}) при запросе {url}"
+                        f"Ошибка авторизации ({resp.status}) при запросе {url}",
+                        resp.status,
                     )
                 if resp.status != 200:
                     _LOGGER.debug("Ответ %s на %s: %s", resp.status, url, text[:500])
-                    raise IntersvyazApiError(f"HTTP {resp.status} при запросе {url}")
+                    raise IntersvyazApiError(
+                        f"HTTP {resp.status} при запросе {url}", resp.status
+                    )
 
                 if not text:
                     return None
@@ -136,12 +145,43 @@ class IntersvyazApiClient:
     # ------------------------------------------------------------------ #
     # Домофон / реле
     # ------------------------------------------------------------------ #
-    async def get_relay_id(self) -> str:
+    async def get_relays(self) -> list[dict]:
+        """Все реле (входы, калитки, ворота), доступные по адресу.
+
+        API возвращает список; раньше интеграция брала только его первый
+        элемент, из-за чего при нескольких реле (главный и запасной вход,
+        калитки) открыть можно было только одно из них.
+        Элементы без RELAY_ID отбрасываются, дубликаты по RELAY_ID схлопываются.
+        """
         data = await self._request("GET", f"{BASE_URL}/domofon/relays", auth=True)
-        if isinstance(data, list) and data:
-            relay_id = data[0].get("RELAY_ID")
-            if relay_id:
-                return relay_id
+        if not isinstance(data, list):
+            raise IntersvyazApiError(
+                f"Неожиданный формат списка реле: {type(data).__name__}"
+            )
+        _LOGGER.debug(
+            "Поля реле в ответе API (только имена, без значений): %s",
+            sorted({k for item in data if isinstance(item, dict) for k in item}),
+        )
+        relays: list[dict] = []
+        seen: set[str] = set()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            relay_id = item.get("RELAY_ID")
+            if relay_id in (None, ""):
+                continue
+            relay_id = str(relay_id)
+            if relay_id in seen:
+                continue
+            seen.add(relay_id)
+            relays.append({**item, "RELAY_ID": relay_id})
+        return relays
+
+    async def get_relay_id(self) -> str:
+        """ID первого реле (поведение старой общей кнопки и сервиса)."""
+        relays = await self.get_relays()
+        if relays:
+            return relays[0]["RELAY_ID"]
         raise IntersvyazApiError("API не вернул список реле")
 
     async def open_door(self, relay_id: str) -> None:
@@ -155,23 +195,45 @@ class IntersvyazApiClient:
     # ------------------------------------------------------------------ #
     # Камеры
     # ------------------------------------------------------------------ #
-    async def get_group_id(self) -> str:
-        """ID группы 'Умный двор', либо, если её нет, 'Свои камеры'."""
+    async def get_group_ids(self) -> list[str]:
+        """ID всех групп камер адреса.
+
+        Берутся все группы «Умный двор…» и группа «Свои камеры». Раньше
+        использовалась только первая найденная группа, поэтому камеры из
+        остальных групп в Home Assistant не попадали.
+        """
+        group_ids: list[str] = []
+
         data = await self._request("GET", f"{BASE_URL_CAM}/api/get-group/", auth=True)
-        for group in data or []:
-            if group.get("NAME", "").startswith("Умный двор"):
-                return group["ID"]
+        for group in data if isinstance(data, list) else []:
+            if str(group.get("NAME", "")).startswith("Умный двор") and group.get("ID"):
+                group_ids.append(str(group["ID"]))
 
-        data = await self._request(
-            "GET", f"{BASE_URL_CAM}/api/get-group/?selfCams=true", auth=True
-        )
-        for group in data or []:
-            if group.get("NAME") == "Свои камеры":
-                return group["ID"]
+        try:
+            data = await self._request(
+                "GET", f"{BASE_URL_CAM}/api/get-group/?selfCams=true", auth=True
+            )
+        except IntersvyazAuthError:
+            raise
+        except IntersvyazApiError as err:
+            if not group_ids:
+                raise
+            _LOGGER.debug("Не удалось получить группу 'Свои камеры': %s", err)
+            data = []
+        for group in data if isinstance(data, list) else []:
+            if group.get("NAME") == "Свои камеры" and group.get("ID"):
+                group_ids.append(str(group["ID"]))
 
-        raise IntersvyazApiError(
-            "Не найдены ни группа 'Умный двор', ни 'Свои камеры'"
-        )
+        group_ids = list(dict.fromkeys(group_ids))
+        if not group_ids:
+            raise IntersvyazNoCamerasError(
+                "Не найдены ни группа 'Умный двор', ни 'Свои камеры'"
+            )
+        return group_ids
+
+    async def get_group_id(self) -> str:
+        """ID первой группы (для обратной совместимости)."""
+        return (await self.get_group_ids())[0]
 
     async def get_group_cameras(self, group_id: str) -> list[dict]:
         data = await self._request(
@@ -180,6 +242,19 @@ class IntersvyazApiClient:
         if not isinstance(data, list):
             raise IntersvyazApiError(f"Неожиданный формат данных камер: {type(data)}")
         return data
+
+    async def get_cameras(self, group_ids: list[str]) -> list[dict]:
+        """Камеры из всех групп без дубликатов (по UUID), в порядке групп."""
+        cameras: list[dict] = []
+        seen: set[str] = set()
+        for group_id in group_ids:
+            for camera in await self.get_group_cameras(group_id):
+                uuid = camera.get("UUID") if isinstance(camera, dict) else None
+                if not uuid or uuid in seen:
+                    continue
+                seen.add(uuid)
+                cameras.append(camera)
+        return cameras
 
     def snapshot_url(self, camera_uuid: str) -> str:
         return f"{BASE_URL_CDN}/snapshot?uuid={camera_uuid}&token=bearer-{self.token}"
